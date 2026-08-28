@@ -154,6 +154,23 @@ export const serverCellExecutorPlugin: JupyterFrontEndPlugin<INotebookCellExecut
             console.warn('[JSD] document_id not set; falling back to path');
           }
 
+          // Mark the cell trusted, now that execution is actually being
+          // dispatched. The default executor gets this from
+          // CodeCellModel.clearExecution(), which runs inside
+          // CodeCell.execute(); the server-side path bypasses that method,
+          // and without the trusted flag JupyterLab refuses unsafe rich
+          // renderers, so e.g. ipywidgets render as their text/plain repr.
+          //
+          // This must happen here rather than earlier in the method: every
+          // path above can return without executing anything (no session
+          // context, or no kernel after the start attempt). Trusting there
+          // would trust a cell that never ran -- and because this path does
+          // not clear the cell's outputs, it would retroactively trust
+          // output loaded from an untrusted notebook, which JupyterLab
+          // would then re-render with unsafe renderers.
+          const previousTrusted = cell.model.trusted;
+          cell.model.trusted = true;
+
           onCellExecutionScheduled({ cell });
           try {
             const response = await ServerConnection.makeRequest(
@@ -172,12 +189,18 @@ export const serverCellExecutorPlugin: JupyterFrontEndPlugin<INotebookCellExecut
               },
               serverSettings
             );
+            if (!response.ok) {
+              // A source mismatch (409) or any other failure (408, 500, etc.)
+              // breaks the chain: the request was never enqueued on the
+              // server, so the next run must not reference it as a
+              // predecessor. Nothing executed either, so restore the previous
+              // trust state rather than leaving the cell trusted.
+              lastRequestIdByDoc.delete(docKey);
+              cell.model.trusted = previousTrusted;
+            }
             if (response.status === 409) {
               // Source mismatch — another user edited the cell after this user
               // pressed Run. Show a visible warning so the user knows to re-run.
-              // Clear the ordering chain: this request was never enqueued on the
-              // server so the next run must not reference it as a predecessor.
-              lastRequestIdByDoc.delete(docKey);
               Notification.warning(
                 'Cell not executed: the cell source changed while the request was in flight. Please re-run the cell.',
                 { autoClose: 5000 }
@@ -185,14 +208,11 @@ export const serverCellExecutorPlugin: JupyterFrontEndPlugin<INotebookCellExecut
               onCellExecuted({ cell, success: false });
               return false;
             }
-            if (!response.ok) {
-              // Any other failure (408, 500, etc.) also breaks the chain —
-              // the request was never successfully enqueued.
-              lastRequestIdByDoc.delete(docKey);
-            }
             onCellExecuted({ cell, success: response.ok });
             return response.ok;
           } catch (error) {
+            // The request never reached the server; nothing executed.
+            cell.model.trusted = previousTrusted;
             onCellExecuted({ cell, success: false });
             if (!cell.isDisposed) {
               throw error;
